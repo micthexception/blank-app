@@ -1,15 +1,23 @@
-# 🔎 Public Presence Checker
+# 🔎 Public Presence Checker Pro
 
-A lightweight Streamlit app that checks **public, legal sources** for a username.
+A fast Streamlit app for **lawful, public-source username checks**.
 
-## Sources queried
-- GitHub API (`/users/{username}`)
+## What’s upgraded
+- Multi-username input (comma/newline)
+- Parallel checks for speed and lower wait time
+- Wider set of legal/public sources
+- Downloadable CSV + JSON exports
+- Clear consent-first safety messaging
+
+## Sources queried (public endpoints)
+- GitHub user API
+- GitLab public user search API
 - Reddit public profile endpoint
 - Hacker News Firebase user endpoint
-- PyPI public search page
-
-## Why this version
-The previous script relied on many private/paid APIs and invalid endpoint patterns. This app focuses on endpoints that are publicly accessible and works with no API keys.
+- Keybase public lookup API
+- Wikimedia (Wikipedia) user query API
+- DEV Community user endpoint
+- PyPI search page
 
 ## Run locally
 ```bash
@@ -21,8 +29,8 @@ streamlit run streamlit_app.py
 
 ## Tests
 ```bash
-pytest
+pytest -q
 ```
 
 ## Legal and ethical use
-Use only with permission and for lawful checks. Do not use for stalking, harassment, or non-consensual surveillance.
+Use with permission and only for lawful, legitimate checks (e.g., your own accounts or approved security workflows). Do not use for stalking, harassment, or non-consensual surveillance.
