@@ -1,23 +1,29 @@
 # 🔎 Public Presence Checker Pro
 
-A fast Streamlit app for **lawful, public-source username checks**.
+High-coverage Streamlit app for **lawful, public-source username checks**.
 
-## What’s upgraded
-- Multi-username input (comma/newline)
-- Parallel checks for speed and lower wait time
-- Wider set of legal/public sources
-- Downloadable CSV + JSON exports
-- Clear consent-first safety messaging
+## Upgrades in this version
+- More free public sources (13 total checks)
+- Multi-username batch processing
+- Parallel workers for faster runs
+- Account-age/timeline summary from publicly exposed creation timestamps
+- CSV + JSON export
+- Explicit safety boundary: no private-login/surveillance inference
 
-## Sources queried (public endpoints)
-- GitHub user API
-- GitLab public user search API
-- Reddit public profile endpoint
-- Hacker News Firebase user endpoint
-- Keybase public lookup API
-- Wikimedia (Wikipedia) user query API
-- DEV Community user endpoint
-- PyPI search page
+## Sources (public endpoints)
+- GitHub
+- GitLab
+- Reddit
+- Hacker News
+- Keybase
+- Wikimedia (Wikipedia)
+- DEV Community
+- Stack Overflow (StackExchange API)
+- Docker Hub
+- Bitbucket
+- Chess.com
+- PyPI search
+- npm maintainer search
 
 ## Run locally
 ```bash
@@ -32,5 +38,5 @@ streamlit run streamlit_app.py
 pytest -q
 ```
 
-## Legal and ethical use
-Use with permission and only for lawful, legitimate checks (e.g., your own accounts or approved security workflows). Do not use for stalking, harassment, or non-consensual surveillance.
+## Legal & ethical use
+Use only with permission and lawful purpose. This tool is designed for public data checks and explicitly avoids building private behavior surveillance profiles.
