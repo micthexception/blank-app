@@ -36,6 +36,10 @@ class FileAnalysis:
 
 st.set_page_config(page_title="Document Organizer", page_icon="🗂️", layout="wide")
 st.title("🗂️ Document Organizer")
+st.success(
+    "✅ You are running the Document Organizer app (not the Streamlit demo).",
+    icon="✅",
+)
 st.write(
     "Upload or paste JSON, PDF, or TXT files and organize them into custom sections. "
     "The app builds a full index and generates a downloadable report."
@@ -62,6 +66,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, Optional[str]]:
         return "", "PDF support requires PyPDF2. Add it to requirements to enable parsing."
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
+        reader = PdfReader(file_bytes)
         pages = [page.extract_text() or "" for page in reader.pages]
         text = "\n".join(pages).strip()
         return text, None
