@@ -1,539 +1,330 @@
+from __future__ import annotations
+
+import csv
 import io
 import json
-import textwrap
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
-import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from datetime import datetime, timezone
+from typing import Callable, Dict, List, Optional, Tuple
 
+import requests
 import streamlit as st
 
-try:
-    from PyPDF2 import PdfReader
-except ImportError:  # pragma: no cover - optional dependency
-except ImportError:  # pragma: no cover - optional dependency handled in UI
-    PdfReader = None
+REQUEST_TIMEOUT = 10
+DEFAULT_UA = "public-presence-checker/3.0"
 
 
 @dataclass
-class SectionRule:
-    name: str
-    keywords: List[str]
+class SourceResult:
+    source: str
+    found: bool
+    status: str
+    profile_url: str = ""
+    summary: str = ""
+    created_at: str = ""
 
 
-@dataclass
-class FileAnalysis:
-    name: str
-    extension: str
-    text: str
-    assigned_section: str
-    matched_keywords: List[str]
-    excerpt: str
-    notes: Optional[str] = None
-
-
-st.set_page_config(page_title="Document Organizer", page_icon="🗂️", layout="wide")
-st.title("🗂️ Document Organizer")
-st.success(
-    "✅ You are running the Document Organizer app (not the Streamlit demo).",
-    icon="✅",
-)
-st.write(
-    "Upload or paste JSON, PDF, or TXT files and organize them into custom sections. "
-    "The app builds a full index and generates a downloadable report."
-)
-
-
-def parse_section_rules(raw_rules: str) -> List[SectionRule]:
-    rules: List[SectionRule] = []
-    for line in raw_rules.splitlines():
-        if not line.strip():
-            continue
-        if ":" in line:
-            name, keyword_block = line.split(":", 1)
-            keywords = [item.strip() for item in keyword_block.split(",") if item.strip()]
-        else:
-            name = line.strip()
-            keywords = []
-        rules.append(SectionRule(name=name.strip(), keywords=keywords))
-    return rules
-
-
-def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, Optional[str]]:
-    if PdfReader is None:
-        return "", "PDF support requires PyPDF2. Add it to requirements to enable parsing."
+def iso_to_age(iso_value: str) -> str:
+    if not iso_value:
+        return ""
     try:
-        reader = PdfReader(io.BytesIO(file_bytes))
-        reader = PdfReader(file_bytes)
-        pages = [page.extract_text() or "" for page in reader.pages]
-        text = "\n".join(pages).strip()
-        return text, None
-    except Exception as exc:  # pragma: no cover - defensive
-        return "", f"PDF parsing error: {exc}"
+        parsed = datetime.fromisoformat(iso_value.replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)
+        years = max(delta.days // 365, 0)
+        return f"{years}y" if years else "<1y"
+    except ValueError:
+        return ""
 
 
-def extract_text_from_json(file_bytes: bytes, repair: bool) -> Tuple[str, Optional[str]]:
+def fetch_json(url: str, headers: Optional[Dict[str, str]] = None) -> Tuple[Optional[Dict], Optional[str], int]:
+    merged_headers = {"User-Agent": DEFAULT_UA, "Accept": "application/json", **(headers or {})}
     try:
-        data = json.loads(file_bytes.decode("utf-8"))
-        pretty = json.dumps(data, indent=2, ensure_ascii=False)
-        return pretty, None
-    except Exception as exc:
-        if repair:
-            fallback_text = file_bytes.decode("utf-8", errors="ignore")
-            cleaned = fallback_text.replace(",]", "]").replace(",}", "}")
-            try:
-                data = json.loads(cleaned)
-                pretty = json.dumps(data, indent=2, ensure_ascii=False)
-                return pretty, f"JSON parse repaired after error: {exc}"
-            except Exception:
-                return fallback_text, f"JSON parse error: {exc}"
-        return file_bytes.decode("utf-8", errors="ignore"), f"JSON parse error: {exc}"
+        response = requests.get(url, headers=merged_headers, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        return None, str(exc), 0
+
+    status_code = response.status_code
+    if status_code == 404:
+        return None, None, 404
+    if status_code >= 400:
+        return None, f"http {status_code}", status_code
+
+    try:
+        return response.json(), None, status_code
+    except ValueError:
+        return None, "invalid json", status_code
 
 
-def extract_text(uploaded_file, repair_json: bool) -> Tuple[str, str, Optional[str]]:
-    extension = uploaded_file.name.split(".")[-1].lower()
-    file_bytes = uploaded_file.getvalue()
-    if extension == "pdf":
-        text, note = extract_text_from_pdf(file_bytes)
-    elif extension == "json":
-        text, note = extract_text_from_json(file_bytes, repair_json)
-    else:
-        text = file_bytes.decode("utf-8", errors="ignore")
-        note = None
-    return text, extension, note
+def check_github(username: str) -> SourceResult:
+    data, error, code = fetch_json(f"https://api.github.com/users/{username}")
+    if code == 404:
+        return SourceResult("GitHub", False, "not found")
+    if error or data is None:
+        return SourceResult("GitHub", False, f"error: {error or 'unknown'}")
+    created = data.get("created_at", "")
+    summary = f"Repos: {data.get('public_repos', 0)} | Followers: {data.get('followers', 0)} | Age: {iso_to_age(created)}"
+    return SourceResult("GitHub", True, "found", data.get("html_url", ""), summary, created)
 
 
-def match_keywords(text: str, rule: SectionRule) -> List[str]:
-    lowered = text.lower()
-    candidates = rule.keywords or rule.name.split()
-    return [kw for kw in candidates if kw and kw.lower() in lowered]
+def check_gitlab(username: str) -> SourceResult:
+    data, error, _ = fetch_json(f"https://gitlab.com/api/v4/users?username={username}")
+    if error or data is None:
+        return SourceResult("GitLab", False, f"error: {error or 'unknown'}")
+    if not data:
+        return SourceResult("GitLab", False, "not found")
+    user = data[0]
+    created = user.get("created_at", "")
+    summary = f"State: {user.get('state', 'unknown')} | Age: {iso_to_age(created)}"
+    return SourceResult("GitLab", True, "found", user.get("web_url", ""), summary, created)
 
 
-def summarize_text(text: str, max_chars: int = 240) -> str:
-    cleaned = " ".join(text.split())
-    return textwrap.shorten(cleaned, width=max_chars, placeholder="…")
+def check_reddit(username: str) -> SourceResult:
+    data, error, code = fetch_json(f"https://www.reddit.com/user/{username}/about.json")
+    if code == 404:
+        return SourceResult("Reddit", False, "not found")
+    if error or data is None:
+        return SourceResult("Reddit", False, f"error: {error or 'unknown'}")
+    user_data = data.get("data", {})
+    created_utc = user_data.get("created_utc")
+    created = datetime.fromtimestamp(created_utc, tz=timezone.utc).isoformat() if created_utc else ""
+    summary = f"Karma: {user_data.get('total_karma', 0)} | Age: {iso_to_age(created)}"
+    return SourceResult("Reddit", True, "found", f"https://www.reddit.com/user/{username}/", summary, created)
 
 
-def extract_snippets(text: str, keywords: Iterable[str], window: int = 180) -> List[str]:
-    lowered = text.lower()
-    snippets: List[str] = []
-    for keyword in keywords:
-        if not keyword:
-            continue
-        target = keyword.lower()
-        start = 0
-        while True:
-            idx = lowered.find(target, start)
-            if idx == -1:
-                break
-            begin = max(idx - window, 0)
-            end = min(idx + len(keyword) + window, len(text))
-            snippet = text[begin:end].strip()
-            if snippet and snippet not in snippets:
-                snippets.append(snippet)
-            start = idx + len(keyword)
-    return snippets
+def check_hackernews(username: str) -> SourceResult:
+    data, error, code = fetch_json(f"https://hacker-news.firebaseio.com/v0/user/{username}.json")
+    if code == 404 or data is None:
+        return SourceResult("Hacker News", False, "not found" if not error else f"error: {error}")
+    created_unix = data.get("created")
+    created = datetime.fromtimestamp(created_unix, tz=timezone.utc).isoformat() if created_unix else ""
+    summary = f"Karma: {data.get('karma', 0)} | Age: {iso_to_age(created)}"
+    return SourceResult("Hacker News", True, "found", f"https://news.ycombinator.com/user?id={username}", summary, created)
 
 
-with st.sidebar:
-    st.header("1) Add content")
-    uploaded_files = st.file_uploader(
-        "Drop JSON, PDF, or TXT files",
-        type=["json", "pdf", "txt"],
-        accept_multiple_files=True,
+def check_keybase(username: str) -> SourceResult:
+    data, error, _ = fetch_json(f"https://keybase.io/_/api/1.0/user/lookup.json?usernames={username}")
+    if error or data is None:
+        return SourceResult("Keybase", False, f"error: {error or 'unknown'}")
+    if not data.get("them"):
+        return SourceResult("Keybase", False, "not found")
+    return SourceResult("Keybase", True, "found", f"https://keybase.io/{username}", "Public identity available")
+
+
+def check_wikimedia(username: str) -> SourceResult:
+    url = f"https://en.wikipedia.org/w/api.php?action=query&list=users&ususers={username}&format=json"
+    data, error, _ = fetch_json(url)
+    if error or data is None:
+        return SourceResult("Wikimedia", False, f"error: {error or 'unknown'}")
+    users = data.get("query", {}).get("users", [])
+    if not users or "missing" in users[0]:
+        return SourceResult("Wikimedia", False, "not found")
+    return SourceResult("Wikimedia", True, "found", f"https://en.wikipedia.org/wiki/User:{username}", "Wikipedia account exists")
+
+
+def check_devto(username: str) -> SourceResult:
+    data, error, code = fetch_json(f"https://dev.to/api/users/by_username?url={username}")
+    if code == 404:
+        return SourceResult("DEV Community", False, "not found")
+    if error or data is None:
+        return SourceResult("DEV Community", False, f"error: {error or 'unknown'}")
+    summary = f"Articles: {data.get('articles_count', 0)}"
+    return SourceResult("DEV Community", True, "found", f"https://dev.to/{username}", summary)
+
+
+def check_stackoverflow(username: str) -> SourceResult:
+    url = f"https://api.stackexchange.com/2.3/users?inname={username}&site=stackoverflow&pagesize=1"
+    data, error, _ = fetch_json(url)
+    if error or data is None:
+        return SourceResult("Stack Overflow", False, f"error: {error or 'unknown'}")
+    items = data.get("items", [])
+    if not items:
+        return SourceResult("Stack Overflow", False, "not found")
+    user = items[0]
+    summary = f"Reputation: {user.get('reputation', 0)}"
+    return SourceResult("Stack Overflow", True, "found", user.get("link", ""), summary)
+
+
+def check_dockerhub(username: str) -> SourceResult:
+    data, error, code = fetch_json(f"https://hub.docker.com/v2/users/{username}/")
+    if code == 404:
+        return SourceResult("Docker Hub", False, "not found")
+    if error or data is None:
+        return SourceResult("Docker Hub", False, f"error: {error or 'unknown'}")
+    summary = f"Company: {data.get('company', '') or 'n/a'}"
+    return SourceResult("Docker Hub", True, "found", f"https://hub.docker.com/u/{username}", summary)
+
+
+def check_bitbucket(username: str) -> SourceResult:
+    data, error, code = fetch_json(f"https://api.bitbucket.org/2.0/users/{username}")
+    if code == 404:
+        return SourceResult("Bitbucket", False, "not found")
+    if error or data is None:
+        return SourceResult("Bitbucket", False, f"error: {error or 'unknown'}")
+    links = data.get("links", {}).get("html", {}).get("href", "")
+    return SourceResult("Bitbucket", True, "found", links, "Public account exists")
+
+
+def check_chesscom(username: str) -> SourceResult:
+    data, error, code = fetch_json(f"https://api.chess.com/pub/player/{username}")
+    if code == 404:
+        return SourceResult("Chess.com", False, "not found")
+    if error or data is None:
+        return SourceResult("Chess.com", False, f"error: {error or 'unknown'}")
+    return SourceResult("Chess.com", True, "found", data.get("url", ""), "Public chess profile exists")
+
+
+def check_pypi_search(query: str) -> SourceResult:
+    url = f"https://pypi.org/search/?q={query}"
+    try:
+        response = requests.get(url, headers={"User-Agent": DEFAULT_UA}, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        return SourceResult("PyPI search", False, f"error: {exc}")
+    if response.status_code >= 400:
+        return SourceResult("PyPI search", False, f"error: http {response.status_code}")
+    found = "package-snippet" in response.text
+    return SourceResult("PyPI search", found, "found" if found else "not found", url, "Package matches" if found else "No package matches")
+
+
+def check_npm_maintainer(username: str) -> SourceResult:
+    data, error, _ = fetch_json(f"https://registry.npmjs.org/-/v1/search?text=maintainer:{username}&size=1")
+    if error or data is None:
+        return SourceResult("npm maintainer search", False, f"error: {error or 'unknown'}")
+    total = data.get("total", 0)
+    found = total > 0
+    return SourceResult(
+        "npm maintainer search",
+        found,
+        "found" if found else "not found",
+        f"https://www.npmjs.com/search?q=maintainer%3A{username}",
+        f"Matches: {total}",
     )
-    pasted_name = st.text_input("Paste name (optional)", value="pasted-input.txt")
-    pasted_text = st.text_area(
-        "Paste content",
-        placeholder="Paste JSON or text here if you don't want to upload a file.",
-        height=140,
-    )
 
-    st.header("2) Define sections")
-    section_input = st.text_area(
-        "One section per line. Optional keywords after a colon.",
-        placeholder="Apps: iOS, Android, mobile\nLyrics: chorus, verse\nMarketing: campaign, brand",
-        height=170,
-    )
-    user_name = st.text_input("Your name (for the output file)", value="user")
-    include_full_text = st.selectbox(
-        "Detail level",
-        ["Full text", "Snippets only"],
-        help="Choose whether to include full extracted text or just keyword snippets per section.",
-    )
-    output_format = st.selectbox(
-        "Output format",
-        ["Markdown (.md)", "Plain text (.txt)"],
-        help="Choose the file type for the generated report.",
-    )
-    retry_parsing = st.checkbox(
-        "Retry JSON parsing on error (best effort)",
-        value=True,
-        help="Attempts a light cleanup if JSON parsing fails.",
-    )
-    run_button = st.button("Analyze & organize")
 
-st.caption(
-    "Note: Streamlit has an upload limit (default ~200MB). For 700MB files, increase "
-    "`server.maxUploadSize` in Streamlit config."
-)
-
-rules = parse_section_rules(section_input)
-
-if run_button and (uploaded_files or pasted_text.strip()):
-    analyses: List[FileAnalysis] = []
-    for uploaded_file in uploaded_files:
-        text, extension, note = extract_text(uploaded_file, retry_parsing)
-        analyses.append(
-            FileAnalysis(
-                name=uploaded_file.name,
-                extension=extension,
-                text=text,
-                assigned_section="",
-                matched_keywords=[],
-                excerpt=summarize_text(text),
-                notes=note,
-            )
-        )
-
-    if pasted_text.strip():
-        analyses.append(
-            FileAnalysis(
-                name=pasted_name or "pasted-input.txt",
-                extension=pasted_name.split(".")[-1].lower() if "." in pasted_name else "txt",
-                text=pasted_text.strip(),
-                assigned_section="",
-                matched_keywords=[],
-                excerpt=summarize_text(pasted_text.strip()),
-                notes=None,
-            )
-        )
-
-    section_map: Dict[str, List[FileAnalysis]] = {rule.name: [] for rule in rules}
-    section_map.setdefault("Misc", [])
-    rule_lookup = {rule.name: rule for rule in rules}
-    analysis_section_hits: Dict[str, List[str]] = {}
-
-    for analysis in analyses:
-        matched_sections: List[str] = []
-        all_matches: List[str] = []
-        for rule in rules:
-            hits = match_keywords(analysis.text, rule)
-            if hits:
-                matched_sections.append(rule.name)
-                section_map.setdefault(rule.name, []).append(analysis)
-                all_matches.extend(hits)
-        if not matched_sections:
-            matched_sections.append("Misc")
-            section_map["Misc"].append(analysis)
-        analysis.assigned_section = ", ".join(matched_sections)
-        analysis.matched_keywords = list(dict.fromkeys(all_matches)) if all_matches else []
-        analysis_section_hits[analysis.name] = matched_sections
-
-    verification_passed = True
-    for analysis in analyses:
-        expected_sections = []
-        for rule in rules:
-            if match_keywords(analysis.text, rule):
-                expected_sections.append(rule.name)
-        if not expected_sections:
-            expected_sections.append("Misc")
-        if sorted(expected_sections) != sorted(analysis_section_hits.get(analysis.name, [])):
-            verification_passed = False
-            break
-
-    st.subheader("Index")
-    for section_name, items in section_map.items():
-        if not items:
-            continue
-        with st.expander(f"{section_name} ({len(items)} files)", expanded=True):
-            for item in items:
-                rule = rule_lookup.get(section_name)
-                section_hits = match_keywords(item.text, rule) if rule else []
-                st.markdown(f"**{item.name}** (`.{item.extension}`)")
-                st.write(item.excerpt or "No text extracted.")
-                if section_hits:
-                    st.caption(f"Matched keywords: {', '.join(section_hits)}")
-                if item.notes:
-                    st.warning(item.notes)
-
-    report_lines: List[str] = [
-        "# Document Organizer Report",
-        "",
-        "## Summary",
-        "",
-        "Files analyzed and organized into the requested categories with an index "
-        "and detail sections per category.",
-        f"Verification pass: {'passed' if verification_passed else 'needs review'}.",
-        "",
-        "## Index",
-        "",
+def build_checks() -> List[Callable[[str], SourceResult]]:
+    return [
+        check_github,
+        check_gitlab,
+        check_reddit,
+        check_hackernews,
+        check_keybase,
+        check_wikimedia,
+        check_devto,
+        check_stackoverflow,
+        check_dockerhub,
+        check_bitbucket,
+        check_chesscom,
+        check_pypi_search,
+        check_npm_maintainer,
     ]
-    for section_name, items in section_map.items():
-        if not items:
-            continue
-        report_lines.append(f"### {section_name}")
-        for item in items:
-            report_lines.append(f"- {item.name} ({item.extension})")
-        report_lines.append("")
 
-    report_lines.append("## Details")
-    report_lines.append("")
-    for section_name, items in section_map.items():
-        if not items:
-            continue
-        report_lines.append(f"### {section_name}")
-        report_lines.append("")
-        for item in items:
-            rule = rule_lookup.get(section_name)
-            section_hits = match_keywords(item.text, rule) if rule else []
-            report_lines.append(f"#### {item.name}")
-            if item.notes:
-                report_lines.append(f"_Note: {item.notes}_")
-            report_lines.append("")
-            if include_full_text == "Full text":
-                report_lines.append(item.text or "No text extracted.")
-            else:
-                snippets = extract_snippets(item.text, section_hits)
-                if snippets:
-                    for snippet in snippets:
-                        report_lines.append(f"- {snippet}")
-                else:
-                    report_lines.append(item.excerpt or "No text extracted.")
-            report_lines.append("")
 
-    report_text = "\n".join(report_lines)
+def run_checks_for_username(username: str, workers: int = 8) -> List[SourceResult]:
+    checkers = build_checks()
+    results: List[SourceResult] = []
+    with ThreadPoolExecutor(max_workers=min(workers, len(checkers))) as executor:
+        futures = [executor.submit(checker, username) for checker in checkers]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return sorted(results, key=lambda item: item.source.lower())
 
-    base_name = analyses[0].name.rsplit(".", 1)[0] if analyses else "organized"
-    doc_type = analyses[0].extension if analyses else "txt"
-    extension = "md" if output_format.startswith("Markdown") else "txt"
-    output_name = f"{base_name}_{user_name}_{doc_type}.{extension}"
 
-    st.download_button(
-        "Download organized report",
-        data=report_text,
-        file_name=output_name,
-        mime="text/markdown" if extension == "md" else "text/plain",
+def build_csv(rows: List[Dict[str, str]]) -> str:
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["username", "source", "found", "status", "summary", "created_at", "profile_url"],
     )
-    st.subheader("Preview")
-    st.text_area(
-        "Generated report preview",
-        value=report_text,
-        height=240,
-    )
-elif run_button:
-    st.warning("Add files or paste content before running.")
-else:
-    st.info("Add files or paste content, define your sections, then run the organizer.")
-class CategorizationResult:
-    categories: Dict[str, List[str]]
-    misc: List[str]
-    index: Dict[str, int]
-    total_segments: int
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
 
 
-def normalize_categories(raw: str) -> List[str]:
-    categories = [cat.strip() for cat in re.split(r"[\n,]", raw) if cat.strip()]
-    return list(dict.fromkeys(categories))
+def timeline_summary(results: List[SourceResult]) -> str:
+    created = sorted([item.created_at for item in results if item.created_at])
+    if not created:
+        return "No public account-creation timestamps available from matched sources."
+    return f"Earliest visible account creation: {created[0]} | Latest: {created[-1]}"
 
 
-def split_text(text: str) -> List[str]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) >= 3:
-        return lines
-    sentences = [seg.strip() for seg in re.split(r"(?<=[.!?])\s+", text) if seg.strip()]
-    return sentences if sentences else [text]
+st.set_page_config(page_title="Public Presence Checker Pro", page_icon="🔎", layout="wide")
+st.title("🔎 Public Presence Checker Pro")
+st.caption("High-coverage, lawful public-source checks across developer/community platforms.")
 
-
-def categorize_segments(
-    segments: Iterable[str],
-    categories: List[str],
-    include_all_in_misc: bool,
-) -> CategorizationResult:
-    segment_list = list(segments)
-    bucketed = {category: [] for category in categories}
-    misc: List[str] = []
-
-    for segment in segment_list:
-        matched = False
-        for category in categories:
-            if re.search(re.escape(category), segment, re.IGNORECASE):
-                bucketed[category].append(segment)
-                matched = True
-        if include_all_in_misc or not matched:
-            misc.append(segment)
-
-    index = {category: len(items) for category, items in bucketed.items()}
-    index["Misc"] = len(misc)
-    return CategorizationResult(
-        categories=bucketed,
-        misc=misc,
-        index=index,
-        total_segments=len(segment_list),
+with st.expander("Safety + legal boundary", expanded=True):
+    st.write(
+        "This app is for permission-based public checks only. It does NOT infer private login schedules, "
+        "tracking patterns, or surveillance timelines."
     )
 
-
-def load_text_from_upload(upload) -> Tuple[str, str]:
-    suffix = Path(upload.name).suffix.lower().lstrip(".")
-    data = upload.read()
-    if suffix in {"txt", "csv", "md"}:
-        return data.decode("utf-8", errors="replace"), suffix
-    if suffix == "json":
-        parsed = json.loads(data.decode("utf-8", errors="replace"))
-        return json.dumps(parsed, indent=2, ensure_ascii=False), suffix
-    if suffix == "pdf":
-        if PdfReader is None:
-            raise ValueError("PyPDF2 is required to read PDF files. Please install it.")
-        reader = PdfReader(upload)
-        pages = [page.extract_text() or "" for page in reader.pages]
-        return "\n".join(pages), suffix
-    raise ValueError("Unsupported file type.")
-
-
-def build_report(
-    source_name: str,
-    username: str,
-    categories: List[str],
-    result: CategorizationResult,
-    detail_level: str,
-) -> str:
-    lines: List[str] = []
-    lines.append("# Organized File Report")
-    lines.append("")
-    lines.append(f"**Source:** {source_name}")
-    lines.append(f"**Prepared for:** {username}")
-    lines.append("")
-    lines.append("## Index")
-    for category in categories:
-        lines.append(f"- {category}: {result.index.get(category, 0)}")
-    lines.append(f"- Misc: {result.index.get('Misc', 0)}")
-    lines.append("")
-    lines.append("## Categorized Content")
-
-    for category in categories:
-        lines.append("")
-        lines.append(f"### {category}")
-        items = result.categories.get(category, [])
-        if not items:
-            lines.append("- _No matches found._")
-            continue
-        if detail_level == "Matched snippets only":
-            for item in items:
-                lines.append(f"- {item}")
-        else:
-            lines.append("\n".join(items))
-
-    lines.append("")
-    lines.append("### Misc")
-    if result.misc:
-        if detail_level == "Matched snippets only":
-            for item in result.misc:
-                lines.append(f"- {item}")
-        else:
-            lines.append("\n".join(result.misc))
-    else:
-        lines.append("- _No misc items found._")
-
-    return "\n".join(lines)
-
-
-st.set_page_config(page_title="File Organizer", page_icon="🗂️", layout="wide")
-
-st.title("🗂️ File Organizer & Index Builder")
-st.write(
-    "Upload or paste a file, define the categories to look for, and generate an indexed, "
-    "organized report with a download-ready output."
-)
-
-with st.expander("Before you start"):
-    st.markdown(
-        """
-        **Heads up on large files (700MB):** Streamlit uploads are limited by server memory and
-        configuration. If a large file fails to upload, paste the content in chunks or increase
-        the server's upload limits.
-        """
-    )
-
-col1, col2 = st.columns(2)
-with col1:
-    username = st.text_input("Your name (used in the output filename)", value="user")
-    categories_input = st.text_area(
-        "Categories (comma or newline separated)",
-        placeholder="apps, lyrics, songs, brand development, marketing, images",
+left, right = st.columns([2, 1])
+with left:
+    usernames_raw = st.text_area(
+        "Usernames (comma/newline separated)",
+        value="octocat",
         height=120,
+        placeholder="octocat, torvalds, mozilla",
     )
-    detail_level = st.selectbox(
-        "Detail level",
-        ["Matched snippets only", "Full matching content"],
-    )
-    include_all_in_misc = st.checkbox(
-        "Include all non-matching content in Misc",
-        value=True,
-    )
+with right:
+    max_workers = st.slider("Parallel workers", min_value=1, max_value=16, value=8)
+    run = st.button("Run checks", type="primary", width="stretch")
 
-with col2:
-    uploaded = st.file_uploader(
-        "Upload a file (JSON, TXT, CSV, or PDF)",
-        type=["json", "txt", "csv", "pdf", "md"],
-    )
-    pasted_text = st.text_area(
-        "Or paste text here",
-        placeholder="Paste your content if upload isn't working.",
-        height=200,
-    )
-
-if st.button("Organize & Build Index", type="primary"):
-    if not categories_input.strip():
-        st.error("Please enter at least one category.")
-        st.stop()
-
-    categories = normalize_categories(categories_input)
-    if not categories:
-        st.error("Please enter valid categories.")
-        st.stop()
-
-    if uploaded is None and not pasted_text.strip():
-        st.error("Upload a file or paste text to continue.")
-        st.stop()
-
-    try:
-        if uploaded is not None:
-            source_text, source_ext = load_text_from_upload(uploaded)
-            source_name = uploaded.name
-        else:
-            source_text = pasted_text
-            source_ext = "txt"
-            source_name = "pasted_text.txt"
-    except Exception as exc:  # pragma: no cover - UI only
-        st.error(f"Could not read the file: {exc}")
-        st.stop()
-
-    segments = split_text(source_text)
-    if not segments:
-        st.error("No readable content found in the file.")
-        st.stop()
-
-    result = categorize_segments(segments, categories, include_all_in_misc)
-    validation = categorize_segments(segments, categories, include_all_in_misc)
-    validation_ok = result.index == validation.index
-
-    report = build_report(source_name, username, categories, result, detail_level)
-
-    st.success("Organization complete.")
-    if validation_ok:
-        st.info("Validation pass: counts match on a second scan.")
+if run:
+    usernames = [item.strip() for item in usernames_raw.replace("\n", ",").split(",") if item.strip()]
+    usernames = list(dict.fromkeys(usernames))
+    if not usernames:
+        st.error("Enter at least one username.")
     else:
-        st.warning("Validation pass: counts differ between scans. Please review the output.")
+        all_rows: List[Dict[str, str]] = []
+        progress = st.progress(0)
 
-    st.subheader("Preview")
-    st.text_area("Organized output", value=report, height=300)
+        for idx, username in enumerate(usernames, start=1):
+            with st.spinner(f"Checking {username}..."):
+                results = run_checks_for_username(username, workers=max_workers)
 
-    output_name = f"{Path(source_name).stem}_{username}.{source_ext if source_ext != 'pdf' else 'txt'}"
-    st.download_button(
-        "Download organized file",
-        data=report,
-        file_name=output_name,
-        mime="text/plain",
-    )
+            found_count = sum(1 for item in results if item.found)
+            st.subheader(f"@{username} — {found_count}/{len(results)} sources matched")
+            st.info(timeline_summary(results))
+
+            table_rows = []
+            for result in results:
+                row = {
+                    "source": result.source,
+                    "found": "yes" if result.found else "no",
+                    "status": result.status,
+                    "summary": result.summary,
+                    "created_at": result.created_at,
+                    "profile_url": result.profile_url,
+                }
+                table_rows.append(row)
+                all_rows.append({"username": username, **row})
+
+            st.dataframe(table_rows, width="stretch")
+            progress.progress(int((idx / len(usernames)) * 100))
+
+        csv_data = build_csv(all_rows)
+        json_data = json.dumps(all_rows, indent=2)
+
+        st.divider()
+        st.subheader("Export results")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.download_button(
+                "Download CSV",
+                data=csv_data,
+                file_name="public_presence_results.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+        with col_b:
+            st.download_button(
+                "Download JSON",
+                data=json_data,
+                file_name="public_presence_results.json",
+                mime="application/json",
+                width="stretch",
+            )
+
+        total_sources = len(build_checks()) * len(usernames)
+        total_found = sum(1 for row in all_rows if row["found"] == "yes")
+        st.success(f"Completed: {total_found}/{total_sources} source checks matched.")
