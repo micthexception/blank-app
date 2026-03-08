@@ -1,3 +1,4 @@
+import io
 import json
 import textwrap
 from dataclasses import dataclass
@@ -60,7 +61,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, Optional[str]]:
     if PdfReader is None:
         return "", "PDF support requires PyPDF2. Add it to requirements to enable parsing."
     try:
-        reader = PdfReader(file_bytes)
+        reader = PdfReader(io.BytesIO(file_bytes))
         pages = [page.extract_text() or "" for page in reader.pages]
         text = "\n".join(pages).strip()
         return text, None
