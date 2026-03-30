@@ -1,6 +1,7 @@
 import io
 import json
 import textwrap
+import zipfile
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 import re
@@ -66,7 +67,6 @@ def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, Optional[str]]:
         return "", "PDF support requires PyPDF2. Add it to requirements to enable parsing."
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
-        reader = PdfReader(file_bytes)
         pages = [page.extract_text() or "" for page in reader.pages]
         text = "\n".join(pages).strip()
         return text, None
@@ -137,6 +137,48 @@ def extract_snippets(text: str, keywords: Iterable[str], window: int = 180) -> L
     return snippets
 
 
+def chunk_text(text: str, chunk_size: int) -> List[str]:
+    if chunk_size <= 0:
+        return [text]
+    lines = text.splitlines(keepends=True)
+    chunks: List[str] = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) <= chunk_size:
+            current += line
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(line) <= chunk_size:
+            current = line
+            continue
+        for idx in range(0, len(line), chunk_size):
+            piece = line[idx : idx + chunk_size]
+            if len(piece) == chunk_size:
+                chunks.append(piece)
+            else:
+                current = piece
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
+def build_chunks_zip(
+    chunks: List[str],
+    base_name: str,
+    user_name: str,
+    extension: str,
+) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_name = f"{base_name}_{user_name}_chunk_{index:03d}.{extension}"
+            zip_file.writestr(chunk_name, chunk)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 with st.sidebar:
     st.header("1) Add content")
     uploaded_files = st.file_uploader(
@@ -172,6 +214,19 @@ with st.sidebar:
         "Retry JSON parsing on error (best effort)",
         value=True,
         help="Attempts a light cleanup if JSON parsing fails.",
+    )
+    create_chunks = st.checkbox(
+        "Also create smaller chunk files",
+        value=False,
+        help="Splits the generated report into smaller parts and provides individual and ZIP downloads.",
+    )
+    chunk_size = st.slider(
+        "Chunk size (characters)",
+        min_value=1000,
+        max_value=50000,
+        value=8000,
+        step=500,
+        disabled=not create_chunks,
     )
     run_button = st.button("Analyze & organize")
 
@@ -317,6 +372,28 @@ if run_button and (uploaded_files or pasted_text.strip()):
         file_name=output_name,
         mime="text/markdown" if extension == "md" else "text/plain",
     )
+
+    if create_chunks:
+        report_chunks = chunk_text(report_text, chunk_size)
+        zip_bytes = build_chunks_zip(report_chunks, base_name, user_name, extension)
+        st.subheader("Chunked downloads")
+        st.caption(f"Created {len(report_chunks)} chunk(s) at ~{chunk_size} chars each.")
+
+        st.download_button(
+            "Download all chunks (ZIP)",
+            data=zip_bytes,
+            file_name=f"{base_name}_{user_name}_chunks.zip",
+            mime="application/zip",
+        )
+
+        for index, chunk in enumerate(report_chunks, start=1):
+            st.download_button(
+                f"Download chunk {index}",
+                data=chunk,
+                file_name=f"{base_name}_{user_name}_chunk_{index:03d}.{extension}",
+                mime="text/markdown" if extension == "md" else "text/plain",
+            )
+
     st.subheader("Preview")
     st.text_area(
         "Generated report preview",
